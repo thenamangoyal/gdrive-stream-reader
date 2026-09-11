@@ -11,6 +11,9 @@ Drive for Desktop is a **streaming mount**, not a copy of your Drive. Two things
 1. **`.gdoc` / `.gsheet` / `.gslides` files are pointers, not documents.** They're tiny JSON files with a `doc_id` field. `cat`-ing them gets you metadata; the actual document body has to be fetched over the network.
 2. **Folder shortcuts don't materialize until you open them in the Drive web UI.** A shortcut to "My Friend's Shared Folder" resolves as a symlink under `.shortcut-targets-by-id/<id>/...`, but `ls` returns `No such file or directory` until the folder gets opened in `drive.google.com`.
 
+3. **Docs with tabs come back as one long body.** The Drive MCP returns every tab concatenated, each starting with a `# <tab title>  ` heading, and the `?tab=t.…` id in a Docs URL cannot be passed to it. Long multi-tab docs always trip the 25k-token ceiling, so the skill indexes the tabs from the saved file and reads them one at a time.
+4. **Docs shared with a different Google account than the MCP is signed into** (personal vs Workspace) return "Requested entity was not found". The skill reads those through a second read-only `workspace-mcp` instance bound to that account (Docs API with `includeTabsContent`), never through a browser.
+
 This skill walks Claude through the right MCP calls — `read_file_content`, `search_files`, and `download_file_content` — so it just works regardless of which case you hit.
 
 ## Prerequisites
@@ -109,7 +112,7 @@ The full procedure is in [`SKILL.md`](./SKILL.md), including a self-test checkli
 
 ## Stress tests
 
-Verified against a real Drive account with the following file types and edge cases:
+Verified against a real Drive account with the following file types and edge cases (last additions 2026-09-11):
 
 | Test | Path / setup | Expected | Result |
 |---|---|---|---|
@@ -123,6 +126,10 @@ Verified against a real Drive account with the following file types and edge cas
 | Unmaterialized folder | `ls drivedata/<shortcut>/` | `No such file or directory` (expected fail) | ✅ — `parentId` search returns the children |
 | Bad query field | `search_files { query: "parentId='X' and trashed=false" }` | `Unsupported query field: trashed` | ✅ — gotcha documented |
 | Direct PDF read | `Read drivedata/foo.pdf` | streaming mount fetches bytes | ✅ |
+| Multi-tab Doc (7 tabs, 536k chars) | `read_file_content` on the doc id | all tabs in one saved body, `# <tab>  ` headings | ✅ — 2026-09-11, indexed with `grep -n '^# '` |
+| Empty `{}` reply | first call on the same multi-tab doc | transient; second call returns the body | ✅ — retry documented in procedure E |
+| Doc shared with the user's other Google account | `read_file_content` | `Requested entity was not found` (expected fail) | ✅ — second `workspace-mcp` instance (Docs API) documented in procedure G |
+| Notion public page | `WebFetch` on `*.notion.site` | returns only "Notion" (expected fail) | ✅ — Chrome `get_page_text` documented in procedure H |
 
 ## Troubleshooting
 
@@ -134,6 +141,12 @@ The Drive MCP isn't OAuth'd, or it's authenticated to a different Google account
 
 **"`Unsupported query field: trashed`"**
 Remove `and trashed = false` from your `search_files` query. Trashed and spam files are excluded by default.
+
+**"The MCP only gave me one tab / I need tab X"**
+The MCP returns all tabs in one body; there is no per-tab read. Index the saved body with `grep -n '^# '` and slice by line range (procedure F). If only one heading appears, the doc really has one tab.
+
+**"`Requested entity was not found` but I can open the doc"**
+The doc is shared with a different Google account than the MCP is authenticated to. Register a read-only `workspace-mcp` instance for that account and use its `get_doc_content` (procedure G), or share the doc with the MCP account. Do not read Docs through a browser.
 
 **"`jq: command not found`"**
 `brew install jq` on macOS, or `winget install jqlang.jq` on Windows.

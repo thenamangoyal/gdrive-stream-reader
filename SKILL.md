@@ -1,11 +1,13 @@
 ---
 name: gdrive-stream-reader
-description: Read Google Drive content (Docs, Sheets, Slides, and folders) when the local Google Drive for Desktop streaming mount cannot serve it. Use this skill whenever the user asks you to read a `.gdoc` / `.gsheet` / `.gslides` file, when an `ls` on a `drivedata/...` symlink returns "No such file or directory", when a path resolves under `.shortcut-targets-by-id/`, or whenever the user asks about extracting Google Drive content on macOS or Windows with the Drive for Desktop streaming mount. Also use it for documents whose content exceeds the Drive MCP tool's inline 25k-token reply ceiling (the tool will save the content to disk for chunked reading).
+description: Read Google Drive content (Docs including multi-tab Docs, Sheets, Slides, and folders) when the local Google Drive for Desktop streaming mount cannot serve it, or when the Drive MCP itself needs a workaround. Use this skill whenever the user asks you to read a `.gdoc` / `.gsheet` / `.gslides` file or a Google Docs URL (especially one with `?tab=t.xxxx`), when an `ls` on a `drivedata/...` symlink returns "No such file or directory", when a path resolves under `.shortcut-targets-by-id/`, when `read_file_content` returns an empty `{}` or "Requested entity was not found", when a doc is shared with a different Google account than the Anthropic Drive MCP is signed into, when a public Notion page must be read, or whenever the user asks about extracting Google Drive content on macOS or Windows with the Drive for Desktop streaming mount. Also use it for documents whose content exceeds the Drive MCP tool's inline 25k-token reply ceiling (the tool will save the content to disk for chunked reading).
 ---
 
 # Google Drive streaming reader
 
 This skill teaches Claude how to reliably read Google Drive content when the local Drive for Desktop ("File Stream") mount can't materialize it. The core insight is that `.gdoc` / `.gsheet` / `.gslides` files are **JSON pointers**, not the document body, and that folder shortcuts only materialize on the local mount once they have been opened in the Drive web UI.
+
+As of September 2026 the Drive MCP handles the common cases on its own (it returns all tabs of a Doc, and the harness saves oversized replies to disk). This skill matters for the edge cases: pointer files, unmaterialized shortcuts, chunked reading, empty or not-found replies, docs shared with another account, and Notion pages. Rule throughout: Google content is read through an API (Anthropic Drive MCP or a `workspace-mcp` instance), never through a browser.
 
 The skill relies on the **Anthropic Google Drive MCP** (`mcp__claude_ai_Google_Drive__*` tools). If those tools are not present in the current session, this skill does not apply — direct the user to set up the Drive MCP first (see the `prerequisites` section in `README.md` of the source repo).
 
@@ -18,6 +20,9 @@ Trigger on any of:
 3. The MCP tool `mcp__claude_ai_Google_Drive__read_file_content` returns the "result exceeds maximum allowed tokens" error and saves the content to a `tool-results/...txt` file.
 4. The user describes a Drive folder shortcut they "haven't opened yet" or that's not visible locally.
 5. Any session where files in `drivedata/` or a Drive-mounted directory need to be read in bulk.
+6. The user gives a Google Docs link with `?tab=t.…` or says "read all the tabs" of a document.
+7. `read_file_content` returns an empty `{}`, or "Requested entity was not found" for a doc the user can open in the browser.
+8. The user asks to read a Notion public page (`*.notion.site`) and `WebFetch` returns only the word "Notion".
 
 ## Decision tree
 
@@ -36,8 +41,18 @@ Need to read something from Google Drive on a streaming mount?
 ├── I called read_file_content and got the >25k-token error
 │   └── Use procedure C (jq decode + chunked sed reading)
 │
-└── I got a transient I/O error
-    └── Use procedure E (retry up to 3× with brief backoff)
+├── I got a transient I/O error, or read_file_content returned `{}`
+│   └── Use procedure E (retry up to 3× with brief backoff)
+│
+├── It's a Google Doc with tabs (URL has ?tab=t.…, or the user says "all the tabs")
+│   └── Use procedure F (one read returns every tab; index them by `# <tab title>` headings)
+│
+├── read_file_content says "Requested entity was not found" but the user can open the doc
+│   └── Use procedure G (doc is shared with another Google account; read it through a second
+│       workspace-mcp instance bound to that account, never through a browser)
+│
+└── It's a Notion public page and WebFetch returns only "Notion"
+    └── Use procedure H (Chrome extension get_page_text; the one case where the browser is right)
 ```
 
 ## Procedure A: Read a `.gdoc` / `.gsheet` / `.gslides`
@@ -156,10 +171,54 @@ Drive for Desktop sometimes returns:
 - `Resource temporarily unavailable`
 - An empty read on a file that should exist
 - A 5xx from the MCP
+- `read_file_content` returning a bare `{}` for a doc whose `get_file_metadata` shows a `contentSnippet` (observed 2026-09-11 on a 500 KB multi-tab doc; the next call returned the full body)
 
 These are usually streaming hiccups, not real failures. Wait briefly (1–5 seconds is fine) and retry up to **3 times** before declaring the file missing. Never "fix" a transient error by deleting, recreating, or renaming the file — that destroys the user's data.
 
 If after 3 retries the read still fails, surface the error to the user with the original error string and the file path; do not silently swallow it.
+
+## Procedure F: Google Docs with tabs
+
+Google Docs can hold several **tabs** (the left-hand "Document tabs" panel; URLs carry `?tab=t.<tabId>`). Verified 2026-09-11 against a 7-tab, 536k-character doc:
+
+- `read_file_content` returns **every tab in one reply**, concatenated in tab order. There is no per-tab parameter, and the `tab=` id from the URL cannot be passed to the MCP.
+- Each tab starts with a top-level heading made from the tab title, followed by two trailing spaces: `# <Tab title>  `. Headings inside a tab keep their own levels (`##`, `###`), but a tab's own first heading may also be `#`, so treat the two-trailing-space form as the tab marker.
+- Multi-tab docs almost always exceed the 25k-token reply ceiling, so the body lands on disk (procedure C). Build a tab index before reading:
+
+```bash
+jq -r '.fileContent' /path/to/tool-results/...txt > "$SCRATCH/doc.txt"
+grep -n '^# ' "$SCRATCH/doc.txt"          # one line per tab (plus any in-tab H1s)
+```
+
+- Then read tab by tab with `sed -n '<start>,<end>p'` or `Read` with `offset`/`limit`. For meeting-transcript tabs, strip blank lines first (`grep -v '^\s*$'`) to halve the size; transcripts pasted from Wispr or Granola can contain the same session twice ("Part 1" and "Part 2" opening with identical lines), so compare the openings with `md5` before reading both.
+- To confirm a doc has tabs without fetching the body, `get_file_metadata` is not enough (it does not list tabs); the heading index above is the reliable check.
+- Any script that calls the Google Docs API directly must pass `includeTabsContent=true` to `documents.get`; the default reply carries only the first tab. Both the Anthropic Drive MCP and the community `workspace-mcp` already do this.
+
+## Procedure G: The doc is shared with a different Google account than the Anthropic Drive MCP
+
+Symptom: the user can open the doc, but `read_file_content` returns `Requested entity was not found` and `search_files` by title returns `{}`. Cause: the Anthropic Drive MCP is OAuth'd to one Google account per Claude account, and the doc is shared with another of the user's accounts (for example a Workspace account).
+
+**Use the API, not a browser.** Register a second instance of the community Google Workspace MCP (`workspace-mcp`, taylorwilsdon/google_workspace_mcp) bound to the other account, read-only:
+
+```bash
+claude mcp add docs-<label> -s user \
+  -e GOOGLE_CLIENT_SECRET_PATH=<path to the OAuth client JSON already used by the other workspace-mcp instance> \
+  -e USER_GOOGLE_EMAIL=<other account e-mail> \
+  -e WORKSPACE_MCP_CREDENTIALS_DIR=$HOME/.<label>-credentials \
+  -- uvx workspace-mcp@latest --single-user --permissions docs:readonly drive:readonly
+```
+
+Then run `/mcp` (or restart) so the tools load, call `start_google_auth` with that e-mail once, and let the user complete the consent screen. After that, `get_doc_content` returns the document as markdown; its Docs call uses `includeTabsContent=True` and renders each tab under its own heading, so multi-tab docs work the same way as in procedure F. `search_drive_files` and `get_drive_file_content` cover Sheets, Slides and PDFs on that account.
+
+Notes:
+- One credentials directory per account (`WORKSPACE_MCP_CREDENTIALS_DIR`); `--single-user` uses whatever credentials that directory holds.
+- If the OAuth client is an External app still in testing mode, the other account must be listed as a test user in the Google Cloud console, or consent fails with "access blocked". Tell the user which project and client the JSON belongs to; do not create clients for them.
+- `download_file_content` on the Anthropic MCP fails with the same not-found error, so it is not a fallback.
+- Do not read Google Docs through Chrome (`mobilebasic`, screenshots, page text). It bypasses the API, renders only the first tab, and the user has asked for API access only. The browser is reserved for procedure H.
+
+## Procedure H: Notion public pages
+
+`WebFetch` on a `*.notion.site` page returns only the word "Notion" because the page is rendered client-side, and the Notion MCP (`mcp__claude_ai_Notion__*`) only sees pages inside the connected workspace. For a public share link from another workspace, open it in a **new** Chrome tab with the Claude in Chrome extension and call `get_page_text`; the `<main>` element carries the full page text including headings and bullets. Verified 2026-09-11 on two job-description pages. Close the tab afterwards. This is the only case in this skill where a browser is the right tool.
 
 ## Bulk reads — parallelize via concurrent tool calls
 
@@ -197,6 +256,8 @@ Supported query fields per the MCP's docs: `title`, `fullText`, `mimeType`, `mod
 
 - **`resource_key` requirement.** Some old shared docs require a `resource_key` (visible in the `.gdoc` JSON). The current MCP `read_file_content` tool does not accept a `resource_key` parameter. If a doc that requires one fails to read, the user has to open it in Drive UI first to convert it; there is no skill-side fix.
 - **Files in another user's "Shared with me"** that have not been added to the user's own Drive. `search_files` with `sharedWithMe = true` finds them, but `read_file_content` may still fail with permission errors. Direct the user to add the file to their Drive.
+- **Docs shared with a different Google account of the same user** (personal vs Workspace). The Anthropic MCP returns `Requested entity was not found`; use procedure G (second workspace-mcp instance).
+- **Per-tab reads.** Not possible through either MCP; the whole document comes back and you slice it by tab heading (procedure F).
 - **Comment-mode and suggestion-mode artifacts.** `read_file_content` returns the rendered text, not tracked changes or comments. Use `download_file_content` with `exportMimeType: "application/vnd.openxmlformats-officedocument.wordprocessingml.document"` if comments matter.
 - **`download_file_content` returns base-64.** If the user wants to view it locally, write it to disk yourself (`Write` after base64-decoding); the tool does not save it for you.
 - **Windows.** Drive for Desktop on Windows uses `G:\My Drive\…` paths instead of macOS `~/Library/CloudStorage/…`. The `.gdoc` JSON format and the `.shortcut-targets-by-id` directory both exist on Windows, so the MCP-based parts of this skill work identically; only the local `cat`/`readlink` step needs OS-appropriate substitutes (`type` and `Get-Item -Type SymbolicLink` in PowerShell).
@@ -231,10 +292,17 @@ mcp__claude_ai_Google_Drive__search_files { query: "parentId = '<FOLDER_ID>'", p
 Read { file_path: "drivedata/<some-file>.pdf" }
 ```
 
-If any of (1)–(4) fails, the diagnosis is:
+```
+# 5. Multi-tab doc: heading index shows one `# <tab>  ` line per tab
+mcp__claude_ai_Google_Drive__read_file_content { fileId: "<MULTI_TAB_DOC_ID>" }   # expect the >25k error
+jq -r '.fileContent' <saved file> | grep -c '^# '
+```
+
+If any of (1)–(5) fails, the diagnosis is:
 
 - (1) fails → not a real `.gdoc` pointer (or `jq` not installed; `brew install jq`).
 - (2) fails with auth error → MCP not OAuth'd, or wrong Google account.
 - (2) fails with "exceeds maximum allowed tokens" → that's success in disguise; use Procedure C.
 - (3) fails with `Unsupported query field` → user has added `and trashed = false` to the query (do not).
 - (4) fails with ENOENT → see Procedure E (retry); if still failing, see Procedure B (folder isn't materialized).
+- (5) shows only one heading → the doc has one tab, or an older MCP build that returns the first tab only; check the tab panel in Docs.
